@@ -1,0 +1,679 @@
+#!/usr/bin/env node
+// Spike Journal — single-file server
+// Requires Node 18+
+// Run: node spike-app.js
+// First run: installs deps, prompts for keys, writes .env (mode 600), tests Telegram, starts server.
+
+const fs = require('fs');
+const path = require('path');
+
+const ENV_PATH = path.join(__dirname, '.env');
+
+function ensureDeps() {
+  const needed = ['axios', 'cors', 'dotenv', 'express', 'ws'];
+  const missing = needed.filter(d => { try { require.resolve(d); return false; } catch { return true; } });
+  if (missing.length) {
+    console.log('📦 Installing:', missing.join(' '));
+    require('child_process').execSync(`npm install ${missing.join(' ')} --silent --no-audit --no-fund`, { stdio: 'inherit', cwd: __dirname });
+  }
+}
+
+async function setupEnv() {
+  const readline = require('readline/promises');
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  console.log('\n════════════════════════════════════════');
+  console.log('  First-time setup');
+  console.log('════════════════════════════════════════\n');
+
+  const tdKey = (await rl.question('Twelve Data API key: ')).trim();
+  if (!tdKey) { console.error('✗ Required'); process.exit(1); }
+
+  const tgToken = (await rl.question('Telegram bot token (from @BotFather): ')).trim();
+  if (!tgToken) { console.error('✗ Required'); process.exit(1); }
+
+  let tgChat = (await rl.question('Telegram chat_id (blank to auto-detect): ')).trim();
+  if (!tgChat) {
+    console.log('\n👉 Open Telegram, message your bot (e.g. "hi"), then press Enter here.');
+    await rl.question('');
+    try {
+      const axios = require('axios');
+      const r = await axios.get(`https://api.telegram.org/bot${tgToken}/getUpdates`, { timeout: 10000 });
+      const upd = r.data?.result || [];
+      for (let i = upd.length - 1; i >= 0; i--) {
+        const id = upd[i].message?.chat?.id;
+        if (id) { tgChat = String(id); break; }
+      }
+      if (!tgChat) {
+        console.error('✗ Could not auto-detect chat_id.');
+        console.error('  Telegram said:', JSON.stringify(r.data).slice(0, 300));
+        tgChat = (await rl.question('Paste chat_id manually, or type "skip": ')).trim();
+        if (tgChat === 'skip') { tgChat = ''; console.log('⚠️  Telegram skipped — alerts will not fire.'); }
+      } else {
+        console.log(`✓ chat_id = ${tgChat}`);
+      }
+    } catch (e) {
+      console.error('✗ getUpdates failed:', e.message);
+      process.exit(1);
+    }
+  }
+
+  const env = [
+    `TWELVE_DATA_KEY=${tdKey}`,
+    'PORT=3000',
+    `TELEGRAM_BOT_TOKEN=${tgToken}`,
+    `TELEGRAM_CHAT_ID=${tgChat}`,
+    'ALERT_SCHEDULE=30,15,5,1,0',
+    'ALERT_ENABLED=true'
+  ].join('\n') + '\n';
+  fs.writeFileSync(ENV_PATH, env, { mode: 0o600 });
+
+  process.env.TWELVE_DATA_KEY = tdKey;
+  process.env.TELEGRAM_BOT_TOKEN = tgToken;
+  process.env.TELEGRAM_CHAT_ID = tgChat;
+  rl.close();
+  console.log('✓ .env written (mode 600)\n');
+
+  if (tgChat) {
+    try {
+      const axios = require('axios');
+      await axios.post(`https://api.telegram.org/bot${tgToken}/sendMessage`, {
+        chat_id: tgChat,
+        text: '✅ Spike Journal setup complete. Alerts will arrive here.',
+        parse_mode: 'HTML'
+      }, { timeout: 10000 });
+      console.log('✓ Telegram test sent — check your phone\n');
+    } catch (e) {
+      console.error('⚠️  Telegram test failed:', e.response?.data?.description || e.message);
+      console.error('   Setup saved. Fix .env and re-run if needed.\n');
+    }
+  }
+}
+
+ensureDeps();
+require('dotenv').config({ path: ENV_PATH });
+
+(async () => {
+  if (!process.env.TWELVE_DATA_KEY) await setupEnv();
+  startServer();
+})().catch(e => { console.error(e); process.exit(1); });
+
+// ═══════════════════════════════════════════════
+//  SERVER
+// ═══════════════════════════════════════════════
+function startServer() {
+  const express = require('express');
+  const axios = require('axios');
+  const cors = require('cors');
+  const http = require('http');
+  const WebSocket = require('ws');
+
+  const KEY = process.env.TWELVE_DATA_KEY;
+  const PORT = process.env.PORT || 3000;
+  const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+  const TG_CHAT = process.env.TELEGRAM_CHAT_ID;
+  const ALERT_SCHEDULE = (process.env.ALERT_SCHEDULE || '30,15,5,1,0')
+    .split(',').map(n => parseInt(n.trim())).filter(n => !isNaN(n)).sort((a, b) => b - a);
+  const ALERT_ENABLED = process.env.ALERT_ENABLED !== 'false';
+
+  const TD = 'https://api.twelvedata.com';
+  const app = express();
+  app.use(cors());
+  app.use(express.json());
+
+  const cache = new Map();
+  const TTL = { quote: 5000, price: 2000, atr: 60000, time_series: 60000, economic_calendar: 300000 };
+  async function td(endpoint, params = {}) {
+    const res = await axios.get(`${TD}/${endpoint}`, { params: { ...params, apikey: KEY }, timeout: 15000 });
+    return res.data;
+  }
+  async function tdCached(endpoint, params = {}) {
+    const k = endpoint + ':' + JSON.stringify(params);
+    const ttl = TTL[endpoint] || 10000;
+    const hit = cache.get(k);
+    if (hit && Date.now() - hit.t < ttl) return hit.data;
+    const data = await td(endpoint, params);
+    cache.set(k, { data, t: Date.now() });
+    return data;
+  }
+  function wrap(ep, extra = {}) {
+    return async (req, res) => {
+      try { res.json(await tdCached(ep, { ...req.query, ...extra })); }
+      catch (e) { res.status(500).json({ error: e.message }); }
+    };
+  }
+
+  class TDWebSocket {
+    constructor() { this.ws = null; this.symbols = new Set(); this.handlers = []; this.connect(); }
+    connect() {
+      this.ws = new WebSocket(`wss://ws.twelvedata.com/v1/quotes/price?apikey=${KEY}`);
+      this.ws.on('open', () => {
+        console.log('[ws] connected');
+        if (this.symbols.size) this.subscribe([...this.symbols]);
+      });
+      this.ws.on('message', raw => {
+        let msg; try { msg = JSON.parse(raw.toString()); } catch { return; }
+        if (msg.event === 'price' && msg.symbol) {
+          this.handlers.slice().forEach(h => { if (h.symbol === msg.symbol) { try { h.cb(msg); } catch {} } });
+        }
+      });
+      this.ws.on('close', () => { console.log('[ws] reconnect 5s'); setTimeout(() => this.connect(), 5000); });
+      this.ws.on('error', e => console.error('[ws]', e.message));
+    }
+    subscribe(symbols) {
+      if (!symbols?.length) return;
+      const fresh = symbols.filter(s => !this.symbols.has(s));
+      if (!fresh.length) return;
+      fresh.forEach(s => this.symbols.add(s));
+      if (this.ws.readyState === WebSocket.OPEN) {
+        this.ws.send(JSON.stringify({ action: 'subscribe', params: { symbols: fresh.join(',') } }));
+      }
+    }
+    unsubscribe(symbols) {
+      if (!symbols?.length) return;
+      symbols.forEach(s => this.symbols.delete(s));
+      if (this.ws.readyState === WebSocket.OPEN) {
+        this.ws.send(JSON.stringify({ action: 'unsubscribe', params: { symbols: symbols.join(',') } }));
+      }
+    }
+    on(symbol, cb) {
+      const entry = { symbol, cb };
+      this.handlers.push(entry);
+      return () => { this.handlers = this.handlers.filter(h => h !== entry); };
+    }
+  }
+  const tdWs = new TDWebSocket();
+
+  async function tgSend(text) {
+    if (!TG_TOKEN || !TG_CHAT) return;
+    try {
+      await axios.post(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`, {
+        chat_id: TG_CHAT, text, parse_mode: 'HTML', disable_web_page_preview: true
+      }, { timeout: 10000 });
+    } catch (e) { console.error('[tg]', e.response?.data?.description || e.message); }
+  }
+
+  const AUTO_LOG = path.join(__dirname, 'auto-signals.json');
+  let autoSignals = fs.existsSync(AUTO_LOG) ? JSON.parse(fs.readFileSync(AUTO_LOG, 'utf8')) : [];
+  const saveAuto = () => fs.writeFileSync(AUTO_LOG, JSON.stringify(autoSignals, null, 2));
+
+  const PAIRS = ['EUR/USD', 'GBP/USD', 'USD/JPY', 'AUD/USD', 'XAU/USD', 'USD/CAD'];
+  const COUNTRY_CUR = {
+    US: 'USD', EU: 'EUR', EA: 'EUR', DE: 'EUR', FR: 'EUR', IT: 'EUR', ES: 'EUR',
+    GB: 'GBP', UK: 'GBP', JP: 'JPY', AU: 'AUD', CA: 'CAD', CH: 'CHF', NZ: 'NZD', CN: 'CNY'
+  };
+
+  const EVENT_DESC = {
+    'core cpi': 'Core CPI — Fed-preferred inflation gauge. Hot = hawkish USD.',
+    'cpi': 'Consumer Price Index — headline inflation.',
+    'core pce': 'Core PCE — Fed primary inflation target.',
+    'pce': 'PCE price index.',
+    'nonfarm': 'Non-Farm Payrolls — job creation. Strong = hawkish USD.',
+    'non-farm': 'Non-Farm Payrolls.',
+    'nfp': 'Non-Farm Payrolls.',
+    'unemployment': 'Unemployment rate.',
+    'average hourly': 'Wage inflation proxy.',
+    'fomc': 'FOMC decision + statement + presser. Highest impact.',
+    'rate decision': 'Central bank rate decision.',
+    'ecb': 'ECB decision.', 'boe': 'BoE decision.', 'boj': 'BoJ decision.',
+    'ppi': 'Producer Price Index — pipeline inflation.',
+    'gdp': 'GDP — headline growth.',
+    'retail sales': 'Consumer spending.',
+    'pmi': 'PMI — business activity.', 'ism': 'ISM — business sentiment.',
+    'jobless claims': 'Weekly claims.', 'adp': 'ADP private payrolls.',
+    'durable goods': 'Big-ticket orders.', 'consumer confidence': 'Consumer sentiment.'
+  };
+  const IMPACT_HORIZON = {
+    'cpi': { days: '1–3', persist: 'Strong — sets USD tone for the week.' },
+    'core cpi': { days: '1–3', persist: 'Strong — drives Fed expectations.' },
+    'pce': { days: '1–2', persist: 'Moderate.' },
+    'nonfarm': { days: '1–2', persist: 'Strong — weekly USD tone.' },
+    'fomc': { days: '3–5', persist: 'Very strong — full repricing.' },
+    'rate decision': { days: '3–5', persist: 'Very strong.' },
+    'ppi': { days: '1', persist: 'Moderate — leads CPI.' },
+    'gdp': { days: '2–3', persist: 'Moderate.' },
+    'retail sales': { days: '1–2', persist: 'Moderate.' },
+    'pmi': { days: '1–2', persist: 'Moderate.' },
+    'jobless claims': { days: '0–1', persist: 'Weak — intraday only.' }
+  };
+  const CONFIRM_BY_CLASS = {
+    inflation: ['Pre-news range holds', '2Y yield moves same direction', 'DXY confirms', 'Follow-through at London/NY open', 'Next day: no full retrace'],
+    employment: ['Pre-news range holds', 'DXY confirms', 'S&P 500 matches risk narrative', 'No full retrace within 4h'],
+    central_bank: ['OIS/swap rate expectations shift', 'Yield curve consistent', 'Pair holds beyond pre-news range at NY close', 'Follow-through 2–3 sessions'],
+    growth: ['Commodities/risk assets confirm', 'Pre-news range holds', 'No full retrace'],
+    generic: ['Pre-news range holds', 'Volume decay <70% in 30min', 'No full retrace within 4h']
+  };
+
+  function classifyEvent(n = '') {
+    n = n.toLowerCase();
+    if (/cpi|pce|ppi|inflation|price index/.test(n)) return 'inflation';
+    if (/nonfarm|non-farm|nfp|unemployment|payroll|adp|jobless|earnings/.test(n)) return 'employment';
+    if (/fomc|rate decision|ecb|boe|boj|fed funds|interest rate/.test(n)) return 'central_bank';
+    if (/gdp|retail|pmi|ism|growth|production/.test(n)) return 'growth';
+    return 'generic';
+  }
+  function describeEvent(n = '') { n = n.toLowerCase(); for (const k in EVENT_DESC) if (n.includes(k)) return EVENT_DESC[k]; return 'Economic release.'; }
+  function horizonFor(n = '') { n = n.toLowerCase(); for (const k in IMPACT_HORIZON) if (n.includes(k)) return IMPACT_HORIZON[k]; return { days: '0–1', persist: 'Weak / intraday.' }; }
+  function confirmationsFor(n = '') { return CONFIRM_BY_CLASS[classifyEvent(n)]; }
+  function currencyOf(e) { if (e.currency) return e.currency.toUpperCase(); if (e.country) return COUNTRY_CUR[e.country.toUpperCase()] || null; return null; }
+  function pairBias(pair, cur, surprise) {
+    const [b, q] = pair.split('/');
+    if (cur === b) return surprise > 0 ? 'BUY' : 'SELL';
+    if (cur === q) return surprise > 0 ? 'SELL' : 'BUY';
+    return null;
+  }
+  function parseNum(v) { if (v == null) return null; const m = String(v).match(/-?\d+(\.\d+)?/); return m ? parseFloat(m[0]) : null; }
+  function parseEventDate(d, t) { if (!d) return null; return new Date(`${d}T${t && t !== 'All Day' ? t : '00:00'}:00Z`); }
+
+  function normalizeEvents(raw) {
+    const arr = raw?.result?.data || raw?.data || raw?.values || [];
+    return arr.map(e => ({
+      id: `ev_${(e.date || '')}_${(e.time || '')}_${(e.country || '')}_${(e.event || '').replace(/\s+/g, '_')}`.slice(0, 140),
+      date: e.date, time: e.time,
+      timestamp: parseEventDate(e.date, e.time)?.getTime(),
+      country: e.country, currency: currencyOf(e),
+      event: e.event, impact: (e.impact || '').toLowerCase(),
+      actual: parseNum(e.actual), forecast: parseNum(e.forecast), previous: parseNum(e.previous)
+    })).filter(e => e.timestamp && e.event);
+  }
+
+  async function gatherContext(pair) {
+    const [q, a] = await Promise.all([
+      td('quote', { symbol: pair }),
+      td('atr', { symbol: pair, interval: '15min', time_period: 14 })
+    ]);
+    const bid = parseFloat(q.bid), ask = parseFloat(q.ask);
+    const mid = (!isNaN(bid) && !isNaN(ask)) ? (bid + ask) / 2 : parseFloat(q.close);
+    const atr = parseFloat(a?.values?.[0]?.atr);
+    const pipSize = pair === 'USD/JPY' ? 0.01 : (pair === 'XAU/USD' ? 0.1 : 0.0001);
+    const spread = (!isNaN(bid) && !isNaN(ask)) ? (ask - bid) / pipSize : null;
+    return { pair, mid, bid, ask, atr, spread, pipSize };
+  }
+
+  const state = { lastScan: 0, armed: {}, watching: {}, tracked: {} };
+
+  function fmt(v, digits = 5) { return v == null || isNaN(v) ? '—' : Number(v).toFixed(digits); }
+
+  function buildPreAlert(sig, minutesLeft) {
+    const rel = new Date(sig.releaseAt);
+    const cond = (sig.conditionalSignals || []).map(c =>
+      `${c.pair}: <b>hot → ${c.ifHot}</b> | cold → ${c.ifCold}`).join('\n');
+    const ctx = sig.contexts?.[sig.conditionalSignals?.[0]?.pair];
+    const ctxLine = ctx ? `${ctx.pair} ${fmt(ctx.mid)} · ATR ${fmt(ctx.atr)} · spread ${ctx.spread ?? '—'}p` : '';
+    return [
+      `🔔 <b>HIGH IMPACT IN ${minutesLeft === 0 ? 'NOW' : minutesLeft + ' MIN'}</b>`,
+      '',
+      `📅 <b>${sig.eventName}</b> (${sig.currency || sig.country || '—'})`,
+      `🕐 ${rel.toISOString().replace('T', ' ').slice(0, 16)} UTC`,
+      `📊 Forecast: <b>${sig.forecast ?? '—'}</b> | Previous: ${sig.previous ?? '—'}`,
+      '',
+      `📝 ${sig.description}`,
+      '',
+      '⚡ <b>Conditional signals</b>',
+      cond,
+      '',
+      ctxLine,
+      '',
+      '✅ <b>Confirm before entry</b>',
+      sig.confirmations.map(c => `• ${c}`).join('\n')
+    ].join('\n');
+  }
+
+  function buildSpikeMsg(sig) {
+    const f = sig.fired;
+    return [
+      `🚀 <b>SPIKE FIRED — ${f.direction} ${sig.pair}</b>`,
+      '',
+      `Event: ${sig.eventName}`,
+      `Actual ${sig.actual ?? '—'} vs Forecast ${sig.forecast ?? '—'} (surprise ${sig.surprise != null ? sig.surprise.toFixed(3) : '—'})`,
+      '',
+      `Entry <b>${f.entry}</b> · Stop ${f.stop} · Target ${f.target}`,
+      `Move ${f.spikeMoveAtr}× ATR · ${f.matchedBias ? '✅ matched bias' : '⚠️ against bias'}`,
+      '',
+      `📈 <b>Post-signal:</b> ${sig.postSignal.direction} · horizon ${sig.postSignal.horizon} day(s)`,
+      `${sig.postSignal.persist}`,
+      '',
+      '✅ <b>Confirm:</b>',
+      sig.postSignal.confirmations.map(c => `• ${c}`).join('\n')
+    ].join('\n');
+  }
+
+  function buildOutcomeMsg(sig) {
+    const o = sig.outcome;
+    const emoji = o.rMultiple >= 0 ? '✅' : '❌';
+    return [
+      `${emoji} <b>TRADE CLOSED — ${sig.pair}</b>`,
+      '',
+      `Exit: ${o.exitReason} @ ${o.exitPrice}`,
+      `R: <b>${o.rMultiple >= 0 ? '+' : ''}${o.rMultiple.toFixed(2)}R</b>`,
+      `Event: ${sig.eventName}`,
+      `Closed: ${new Date(o.closedAt).toISOString().slice(0, 16).replace('T', ' ')} UTC`
+    ].join('\n');
+  }
+
+  async function fireAlerts() {
+    if (!ALERT_ENABLED) return;
+    const now = Date.now();
+    for (const sig of Object.values(state.armed)) {
+      if (sig.status !== 'armed') continue;
+      if (!sig.notified) sig.notified = {};
+      const rel = new Date(sig.releaseAt).getTime();
+      const msLeft = rel - now;
+      for (const m of ALERT_SCHEDULE) {
+        if (sig.notified[m]) continue;
+        const threshold = m * 60000;
+        if (msLeft <= threshold && msLeft > threshold - 60000) {
+          sig.notified[m] = true;
+          saveAuto();
+          tgSend(buildPreAlert(sig, m));
+          console.log(`[alert] T-${m} → ${sig.eventName}`);
+          break;
+        }
+      }
+    }
+  }
+
+  async function scanCalendar() {
+    const now = new Date();
+    const start = new Date(now.getTime() - 15 * 60000);
+    const end = new Date(now.getTime() + 24 * 3600 * 1000);
+    const fmtD = d => d.toISOString().slice(0, 10);
+    const data = await td('economic_calendar', { start_date: fmtD(start), end_date: fmtD(end) });
+    const events = normalizeEvents(data).filter(e => e.impact === 'high');
+    state.lastScan = Date.now();
+    const known = new Set(autoSignals.map(s => s.eventId));
+    for (const ev of events) {
+      if (known.has(ev.id)) continue;
+      if (ev.timestamp < Date.now() - 2 * 3600 * 1000) continue;
+      await armEvent(ev);
+      known.add(ev.id);
+    }
+    console.log(`[scan] ${events.length} high-impact · ${Object.keys(state.armed).length} armed`);
+  }
+
+  async function armEvent(ev) {
+    const cur = ev.currency;
+    if (!cur) return;
+    const affected = PAIRS.filter(p => p.split('/').includes(cur));
+    if (!affected.length) return;
+    const contexts = {};
+    for (const p of affected) { try { contexts[p] = await gatherContext(p); } catch {} }
+
+    const sig = {
+      id: 'auto_' + ev.id, eventId: ev.id, source: 'auto',
+      createdAt: new Date().toISOString(),
+      eventName: ev.event, releaseAt: new Date(ev.timestamp).toISOString(),
+      country: ev.country, currency: cur, impact: ev.impact,
+      description: describeEvent(ev.event),
+      forecast: ev.forecast, previous: ev.previous, actual: null,
+      horizon: horizonFor(ev.event), confirmations: confirmationsFor(ev.event),
+      eventClass: classifyEvent(ev.event),
+      status: 'armed', contexts,
+      conditionalSignals: affected.map(p => ({
+        pair: p, ifHot: pairBias(p, cur, +1), ifCold: pairBias(p, cur, -1)
+      })),
+      fired: null, postSignal: null, outcome: null, notified: {}
+    };
+    autoSignals.unshift(sig);
+    saveAuto();
+    state.armed[ev.id] = sig;
+
+    if (ev.timestamp <= Date.now() + 30000) startSpikeWatch(sig, ev);
+  }
+
+  function startSpikeWatch(sig, ev) {
+    const primary = sig.conditionalSignals[0].pair;
+    const ctx = sig.contexts[primary];
+    if (!ctx) return;
+    if (state.watching[ev.id]?.startedAt) return;
+
+    const watch = {
+      sig, ev, primary, prePrice: ctx.mid, preAtr: ctx.atr,
+      startedAt: Date.now(), samples: [], done: false, unsub: null
+    };
+    state.watching[ev.id] = watch;
+
+    tdWs.subscribe([primary]);
+
+    watch.unsub = tdWs.on(primary, msg => {
+      const px = parseFloat(msg.price);
+      if (isNaN(px) || watch.done) return;
+      const move = px - watch.prePrice;
+      const atrMove = watch.preAtr ? Math.abs(move) / watch.preAtr : 0;
+      watch.samples.push({ t: Date.now(), px, atrMove });
+      if (atrMove >= 0.5) {
+        watch.done = true;
+        if (watch.unsub) watch.unsub();
+        tdWs.unsubscribe([primary]);
+        finalizeSpike(ev.id, move > 0 ? 'spike_up' : 'spike_down');
+      }
+    });
+
+    setTimeout(() => {
+      if (!watch.done) {
+        watch.done = true;
+        if (watch.unsub) watch.unsub();
+        tdWs.unsubscribe([primary]);
+        finalizeSpike(ev.id, 'no_spike');
+      }
+    }, 90000);
+  }
+
+  async function finalizeSpike(eventId, result) {
+    const w = state.watching[eventId];
+    if (!w) return;
+    const sig = w.sig;
+
+    if (sig.actual == null) {
+      try {
+        const day = new Date(w.ev.timestamp).toISOString().slice(0, 10);
+        const d = await td('economic_calendar', { start_date: day, end_date: day });
+        const found = normalizeEvents(d).find(e => e.id === eventId);
+        if (found?.actual != null) sig.actual = found.actual;
+      } catch {}
+    }
+
+    const surprise = (sig.actual != null && sig.forecast != null) ? sig.actual - sig.forecast : null;
+    sig.surprise = surprise;
+
+    if (result === 'no_spike') {
+      sig.status = 'no_spike';
+      sig.fired = { at: new Date().toISOString(), result, reason: 'No breakout ≥0.5× ATR in 90s.' };
+      saveAuto();
+      delete state.watching[eventId];
+      return;
+    }
+
+    const spikeDir = result === 'spike_up' ? 'BUY' : 'SELL';
+    const bias = surprise != null ? pairBias(w.primary, sig.currency, surprise) : null;
+    const confirmed = bias === spikeDir;
+    const ctx = sig.contexts[w.primary];
+    const dist = w.preAtr || 0.001;
+    const slip = ctx.spread ? ctx.spread * ctx.pipSize : 0;
+    const entry = w.prePrice + (spikeDir === 'BUY' ? 1 : -1) * slip;
+    const stop = spikeDir === 'BUY' ? entry - dist : entry + dist;
+    const target = spikeDir === 'BUY' ? entry + 2 * dist : entry - 2 * dist;
+    const maxAtr = w.samples.length ? Math.max(...w.samples.map(s => s.atrMove)).toFixed(2) : '?';
+
+    sig.pair = w.primary;
+    sig.fired = {
+      at: new Date().toISOString(), result, direction: spikeDir, matchedBias: confirmed,
+      entry: +entry.toFixed(5), stop: +stop.toFixed(5), target: +target.toFixed(5),
+      prePrice: w.prePrice, spikeMoveAtr: maxAtr
+    };
+    sig.postSignal = {
+      direction: confirmed ? spikeDir : 'FADE',
+      horizon: sig.horizon.days, persist: sig.horizon.persist,
+      confirmations: sig.confirmations, days: [],
+      note: confirmed
+        ? `Expect ${spikeDir} continuation ${sig.horizon.days} day(s). ${sig.horizon.persist}`
+        : `Market rejected surprise. Fade toward pre-news range.`
+    };
+    sig.status = confirmed ? 'fired' : 'cancelled';
+    saveAuto();
+
+    if (confirmed) {
+      state.tracked[eventId] = {
+        sig, pair: w.primary, direction: spikeDir, entry, stop, target,
+        closeBy: Date.now() + 24 * 3600 * 1000
+      };
+      tgSend(buildSpikeMsg(sig));
+    } else {
+      console.log(`[spike] ${sig.eventName} cancelled (spike ${spikeDir} vs bias ${bias})`);
+    }
+
+    delete state.watching[eventId];
+  }
+
+  async function checkTracked() {
+    for (const [id, t] of Object.entries(state.tracked)) {
+      try {
+        const q = await td('price', { symbol: t.pair });
+        const px = parseFloat(q.price);
+        if (isNaN(px)) continue;
+        let reason = null;
+        if (t.direction === 'BUY') {
+          if (px <= t.stop) reason = 'stop';
+          else if (px >= t.target) reason = 'target';
+        } else {
+          if (px >= t.stop) reason = 'stop';
+          else if (px <= t.target) reason = 'target';
+        }
+        if (!reason && Date.now() > t.closeBy) reason = 'time_stop';
+        if (reason) {
+          const risk = Math.abs(t.entry - t.stop);
+          const pnl = t.direction === 'BUY' ? px - t.entry : t.entry - px;
+          t.sig.outcome = {
+            exitPrice: px, exitReason: reason,
+            rMultiple: risk > 0 ? +(pnl / risk).toFixed(2) : 0,
+            closedAt: new Date().toISOString()
+          };
+          t.sig.status = 'closed';
+          saveAuto();
+          tgSend(buildOutcomeMsg(t.sig));
+          delete state.tracked[id];
+        }
+      } catch {}
+    }
+  }
+
+  async function trackPostSpikeDays() {
+    for (const sig of autoSignals) {
+      if (!sig.fired || sig.status === 'closed' || sig.status === 'cancelled') continue;
+      if (!sig.postSignal) continue;
+      const horizon = parseInt((sig.postSignal.horizon?.match(/\d+/) || ['1'])[0]);
+      if (!sig.postSignal.days) sig.postSignal.days = [];
+      if (sig.postSignal.days.length >= horizon) continue;
+      const lastCheck = sig._lastDayCheck || 0;
+      if (Date.now() - lastCheck < 3600 * 1000) continue;
+      const daysSince = Math.floor((Date.now() - new Date(sig.releaseAt).getTime()) / 86400000);
+      if (daysSince < sig.postSignal.days.length + 1) continue;
+
+      sig._lastDayCheck = Date.now();
+      try {
+        const bars = await td('time_series', { symbol: sig.pair, interval: '1day', outputsize: horizon + 2 });
+        const vals = (bars?.values || []).slice().reverse();
+        if (!vals.length) continue;
+        const bar = vals[sig.postSignal.days.length];
+        if (!bar) continue;
+        const dayClose = parseFloat(bar.close);
+        const heldBeyond = sig.fired.direction === 'BUY'
+          ? dayClose >= sig.fired.prePrice
+          : dayClose <= sig.fired.prePrice;
+        sig.postSignal.days.push({
+          day: sig.postSignal.days.length + 1,
+          date: bar.datetime, close: dayClose,
+          pnlR: +((sig.fired.direction === 'BUY'
+            ? dayClose - sig.fired.entry
+            : sig.fired.entry - dayClose) / Math.abs(sig.fired.entry - sig.fired.stop)).toFixed(2),
+          heldBeyondPreNews: heldBeyond
+        });
+        saveAuto();
+      } catch (e) { console.error('[days]', e.message); }
+    }
+  }
+
+  async function tick() {
+    try {
+      if (Date.now() - state.lastScan > 5 * 60000) await scanCalendar();
+      await fireAlerts();
+      for (const sig of Object.values(state.armed)) {
+        if (sig.status !== 'armed') continue;
+        const t = new Date(sig.releaseAt).getTime();
+        if (t <= Date.now() && !state.watching[sig.eventId]?.startedAt) {
+          startSpikeWatch(sig, { id: sig.eventId, timestamp: t });
+        }
+      }
+      await checkTracked();
+      await trackPostSpikeDays();
+    } catch (e) { console.error('[tick]', e.message); }
+  }
+  setInterval(tick, 10000);
+  tick();
+
+  app.get('/api/quote', wrap('quote'));
+  app.get('/api/price', wrap('price'));
+  app.get('/api/time_series', wrap('time_series'));
+  app.get('/api/atr', wrap('atr', { time_period: '14' }));
+  app.get('/api/economic_calendar', wrap('economic_calendar'));
+  app.get('/api/auto-signals', (req, res) => res.json(autoSignals));
+
+  app.post('/api/auto-signals/:id/adopt', (req, res) => {
+    const s = autoSignals.find(x => x.id === req.params.id);
+    if (!s) return res.status(404).json({ error: 'not found' });
+    s.adoptedAt = new Date().toISOString();
+    if (s.status === 'fired') s.status = 'taken';
+    saveAuto();
+    res.json({ ok: true, signal: s });
+  });
+
+  app.post('/api/auto-signals/:id/skip', (req, res) => {
+    const s = autoSignals.find(x => x.id === req.params.id);
+    if (!s) return res.status(404).json({ error: 'not found' });
+    s.status = 'skipped';
+    saveAuto();
+    res.json({ ok: true });
+  });
+
+  app.get('/api/config', (req, res) => res.json({
+    telegram: { configured: !!(TG_TOKEN && TG_CHAT) },
+    alertSchedule: ALERT_SCHEDULE,
+    alertEnabled: ALERT_ENABLED,
+    scanIntervalSec: 300,
+    tickIntervalSec: 10
+  }));
+
+  app.get('/api/notify/test', async (req, res) => {
+    if (!TG_TOKEN || !TG_CHAT) return res.json({ ok: false, reason: 'Telegram not configured in .env' });
+    await tgSend('✅ <b>Spike Journal test</b>\nIf you see this, alerts are working.');
+    res.json({ ok: true });
+  });
+
+  const server = http.createServer(app);
+  const wss = new WebSocket.Server({ server, path: '/ws/price' });
+
+  wss.on('connection', client => {
+    const unsubs = {};
+    client.on('message', data => {
+      try {
+        const msg = JSON.parse(data.toString());
+        if (msg.action === 'subscribe' && msg.params?.symbols) {
+          const syms = String(msg.params.symbols).split(',').map(s => s.trim());
+          tdWs.subscribe(syms);
+          syms.forEach(s => {
+            unsubs[s] = tdWs.on(s, m => {
+              if (client.readyState === WebSocket.OPEN) client.send(JSON.stringify(m));
+            });
+          });
+        }
+      } catch {}
+    });
+    client.on('close', () => Object.values(unsubs).forEach(fn => fn()));
+  });
+
+  server.listen(PORT, '127.0.0.1', () => {
+    console.log(`✓ Proxy : http://127.0.0.1:${PORT}`);
+    console.log(`  WS    : ws://127.0.0.1:${PORT}/ws/price`);
+    console.log(`  TG    : ${TG_TOKEN && TG_CHAT ? 'configured' : 'not configured'}`);
+    console.log(`  Alerts: T-${ALERT_SCHEDULE.join(', T-')} min`);
+  });
+}
